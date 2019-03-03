@@ -1,0 +1,17 @@
+{
+    "beakerx": {
+        "jvm_options": {
+            "heap_GB": 4,
+            "other": [],
+            "properties": {}
+        },
+        "ui_options": {
+            "auto_close": true,
+            "auto_save": true,
+            "improve_fonts": true,
+            "show_publication": true,
+            "wide_cells": true
+        },
+        "version": 2
+    }
+}
