@@ -9,6 +9,7 @@
             [ppdsp.masking.evaluation
              :refer [unknown-record-displacement
                      masking-experiment
+                     sd-masking-experiment
                      test-classification-accuracy
                      prob-eps-privacy-breach]]
             [clojure.math.numeric-tower :refer [expt sqrt]]
@@ -224,6 +225,47 @@
      (save-data output-file output)
      nil)))
 
+(defn run-sd-masking-experiments
+  [{:keys [dataset output-file sliding-window-sizes
+           aggregation-window-sizes sd-values attack-count
+           attempt-count known-record-counts known-record-ranges
+           known-record-range-position attack-strategies
+           threads-per-configuration classifier-fns
+           threads-per-evaluation seed evaluations]}]
+  (time
+   (let [configurations (for [sliding-window-size sliding-window-sizes
+                              aggregation-window-size aggregation-window-sizes
+                              sd-value sd-values]
+                          {:sliding-window-size sliding-window-size
+                           :aggregation-window-size aggregation-window-size
+                           :sd-value sd-value})
+         results (pmap-pool threads-per-configuration
+                            (fn [{:keys [sliding-window-size
+                                         aggregation-window-size
+                                         sd-value]}]
+                              (sd-masking-experiment
+                               :raw-dataset dataset
+                               :sliding-window-size sliding-window-size
+                               :aggregation-window-size aggregation-window-size
+                               :sd-value sd-value
+                               :classifier-fns classifier-fns
+                               :privacy-evaluation-configuration
+                               {:attack-count attack-count
+                                :attempt-count attempt-count
+                                :evaluation-threads threads-per-evaluation
+                                :known-record-counts known-record-counts
+                                :known-record-ranges known-record-ranges
+                                :known-record-range-position known-record-range-position
+                                :attack-strategies attack-strategies}
+                               :seed seed
+                               :evaluations evaluations))
+                            configurations)
+         output {:original {:accuracy (map-vals #(test-classification-accuracy % dataset)
+                                                classifier-fns)}
+                 :results results}]
+     (save-data output-file output)
+     nil)))
+
 (defn plot-masked-accuracy
   [original-accuracy result
    & {:keys [plot-width plot-height partition-size]}]
@@ -244,10 +286,11 @@
                  :init-height plot-height))))
 
 (defn noise-accuracy-plot
-  [results-cumulative results-independent results-rp-only classifier
+  [results-cumulative results-independent results-rp-only results-sd classifier
    & {:keys [init-width init-height partition-size]}]
   (let [max-cumulative-sigma (apply max (map :cumulative-noise-sigma results-cumulative))
         max-independent-sigma (apply max (map :independent-noise-sigma results-independent))
+        max-sd-value (apply max (map :sd-value results-sd))
         result->accuracies
         (fn [result]
           (->> result
@@ -268,6 +311,11 @@
                 (->> results-independent
                      (filter #(= max-independent-sigma (:independent-noise-sigma %)))
                      first
+                     result->accuracies)
+                (str "Sensitive-Drift; sd-value=" max-sd-value)
+                (->> results-sd
+                     (filter #(= max-sd-value (:sd-value %)))
+                     first
                      result->accuracies)}]
     (doto (plot-lines (or partition-size 500)
                       series
@@ -277,7 +325,8 @@
                       :init-height (or init-height 400)
                       :colours [(Color. 0x00 0x00 0x00)
                                 (Color. 0xda 0x4e 0x6d)
-                                (Color. 0x99 0xae 0xea)])
+                                (Color. 0x99 0xae 0xea)
+                                (Color. 0xae 0xea 0x99)])
       (.setXBound [0 (-> series vals first count)])
       (.setShowLegend false))))
 
@@ -361,7 +410,7 @@
 
 (defn generate-tradeoff-rows
   [results tradeoff-variable classifier attack-strategy epsilon]
-  (let [results (filter #(> (tradeoff-variable %) 0) results)
+  (let [results (filter #(> (get % tradeoff-variable 0) 0) results)
         tradeoff-levels (-> (map tradeoff-variable results)
                             distinct
                             sort
@@ -378,6 +427,7 @@
                                    (prob-eps-privacy-breach $ epsilon))
                          classification-error (- 1 (double accuracy))]]
                {:known-record-count known-record-count
+                :attack-type attack-strategy
                 :tradeoff-var tradeoff-variable
                 :tradeoff tradeoff
                 :tradeoff-level (get tradeoff-levels tradeoff)
@@ -385,23 +435,37 @@
                 :privacy (double privacy)})))))
 
 (defn get-all-tradeoff-rows
-  [results-cumulative results-independent results-rp-only classifier
-   cumulative-attack-strategy independent-attack-strategy epsilon]
-  (concat (map #(assoc % :mask-type "RP Only") (generate-tradeoff-rows results-rp-only :projection-features classifier :a-rp epsilon))
-          (map #(assoc % :mask-type "Cumulative Noise") (generate-tradeoff-rows results-cumulative :cumulative-noise-sigma classifier cumulative-attack-strategy epsilon))
-          (map #(assoc % :mask-type "Independent Noise") (generate-tradeoff-rows results-independent :independent-noise-sigma classifier independent-attack-strategy epsilon))))
+  [results-maps classifier epsilon]
+  (->> results-maps
+       (map (fn [{:keys [mask-type results attack-type comparison-feature]}]
+              (map #(assoc % :mask-type mask-type)
+                   (generate-tradeoff-rows results comparison-feature
+                                           classifier attack-type epsilon))))
+       (apply concat)))
 
 (defn accuracy-privacy-tradeoff-legend
-  [independent-noise-sigmas cumulative-noise-sigmas]
+  [independent-noise-sigmas cumulative-noise-sigmas sd-window-sizes sd-values]
   (let [shapes ["circle" "triangle" "square" "diamond" "cross"]
         cell-count (max (count independent-noise-sigmas)
                         (count cumulative-noise-sigmas))
         header-cells (map #(str "<th>Noise Level " (inc %) "</th>")
                           (range cell-count))
-        independent-noise-cells (map #(str "<td><img src=\"assets/blue-" %2 ".png\"> σ = " (format "%.1e" %1) "</td>")
+        cell-fn (fn [colour value shape]
+                  (str "<td><img style=\"background: " colour
+                       ";\" src=\"assets/blank-" shape ".png\"> "
+                       value "</td>"))
+        independent-noise-cells (map #(cell-fn "#d1e0f1" (str "σ = " (format "%.1e" %1)) %2)
                                      independent-noise-sigmas shapes)
-        cumulative-noise-cells (map #(str "<td><img src=\"assets/red-" %2 ".png\"> σ = " (format "%.1e" %1) "</td>")
-                                    cumulative-noise-sigmas shapes)]
+        cumulative-noise-cells (map #(cell-fn "#d12249" (str "σ = " (format "%.1e" %1)) %2)
+                                    cumulative-noise-sigmas shapes)
+        sd1-cells (map #(cell-fn "#308C56" (str "SD = " (format "%.0f%%" (* %1 100))) %2)
+                       sd-values shapes)
+        sd2-cells (map #(cell-fn "#BFBF63" (str "SD = " (format "%.0f%%" (* %1 100))) %2)
+                       sd-values shapes)
+        sd3-cells (map #(cell-fn "#59433E" (str "SD = " (format "%.0f%%" (* %1 100))) %2)
+                       sd-values shapes)
+        sd4-cells (map #(cell-fn "#5B00BD" (str "SD = " (format "%.0f%%" (* %1 100))) %2)
+                       sd-values shapes)]
     (str "<style>
            .custom-legend {
                margin: auto;
@@ -434,22 +498,38 @@
               <td>RP + Cumulative Noise</td>
               " (string/join cumulative-noise-cells) "
             </tr>
+            <tr>
+              <td>Sensitive-Drift (window = " (nth sd-window-sizes 0) ")</td>
+              " (string/join sd1-cells) "
+            </tr>
+            <tr>
+              <td>Sensitive-Drift (window = " (nth sd-window-sizes 1) ")</td>
+              " (string/join sd2-cells)"
+            </tr>
+            <tr>
+              <td>Sensitive-Drift (window = " (nth sd-window-sizes 2) ")</td>
+              " (string/join sd3-cells) "
+            </tr>
+            <tr>
+              <td>Sensitive-Drift (window = " (nth sd-window-sizes 3) ")</td>
+              " (string/join sd4-cells) "
+            </tr>
           </table>")))
 
 (defn accuracy-privacy-tradeoff-comparison
-  [results-cumulative results-independent results-rp-only
-   classifier cumulative-attack-strategy independent-attack-strategy
-   epsilon & {:keys [plot-width plot-height]}]
-  (let [tradeoff-rows (get-all-tradeoff-rows results-cumulative results-independent results-rp-only
-                                             classifier cumulative-attack-strategy independent-attack-strategy
-                                             epsilon)
+  [results-maps classifier epsilon & {:keys [plot-width plot-height]}]
+  (let [tradeoff-rows (get-all-tradeoff-rows results-maps classifier epsilon)
         x-bound [(max (- 0.02) (- (apply min (map :classification-error tradeoff-rows)) 0.05))
                  (* 1.1 (apply max (map :classification-error tradeoff-rows)))]
         y-bound [(max (- 0.02) (- (apply min (map :privacy tradeoff-rows)) 0.05))
                  (* 1.1 (apply max (map :privacy tradeoff-rows)))]
         colours [(Color. 0x1b 0x21 0x26)
                  (Color. 0xd1 0x22 0x49)
-                 (Color. 0x80 0x9a 0xe5)]
+                 (Color. 0xd1 0xe0 0xf1)
+                 (Color. 0x30 0x8c 0x56)
+                 (Color. 0xbf 0xbf 0x63)
+                 (Color. 0x59 0x43 0x3e)
+                 (Color. 0x5b 0x00 0xbd)]
         markers [{:shape ShapeType/CIRCLE :size 8}
                  {:shape ShapeType/TRIANGLE :size 10}
                  {:shape ShapeType/SQUARE :size 8}
@@ -484,34 +564,41 @@
                        :plot-height (or plot-width 500))))
 
 (defn accuracy-privacy-tradeoff
-  [results-cumulative results-independent results-rp-only
-   classifier cumulative-attack-strategy independent-attack-strategy
-   epsilons & {:keys [square-distance? row-per-noise-level? known-record-count]}]
+  [results-maps classifier epsilons
+   & {:keys [square-distance? row-per-noise-level? known-record-count]}]
   (let [eps-mask-perfs
         (zipmap
          epsilons
          (for [epsilon epsilons]
-           (cond->> (get-all-tradeoff-rows results-cumulative results-independent
-                                           results-rp-only classifier
-                                           cumulative-attack-strategy
-                                           independent-attack-strategy
-                                           epsilon)
-             ;; Optionally restrict to a particular known-record-count
-             known-record-count (filter #(= (:known-record-count %) known-record-count))
-             ;; Group either by mask-type or mask-type+noise-level
-             (not row-per-noise-level?) (group-by :mask-type)
-             row-per-noise-level? (group-by #(if (= (:mask-type %) "RP Only")
-                                               (:mask-type %)
-                                               (str (:mask-type %) " - Level " (:tradeoff-level %))))
-             ;; Compute square distance
-             true (map-vals (fn [rows] (map #(+ (expt (:classification-error %) 2)
-                                                (expt (:privacy %) 2))
-                                            rows)))
-             ;; Optionally convert to distance
-             (not square-distance?) (map-vals #(map sqrt %))
-             ;; Take mean of any multiple rows (only if grouping by
-             ;; mask-type or averaging over many known-record-counts)
-             true (map-vals mean))))
+           (let [tradeoff-rows (get-all-tradeoff-rows results-maps classifier epsilon)
+                 min-error (apply min (map :classification-error tradeoff-rows))
+                 max-error (apply max (map :classification-error tradeoff-rows))
+                 min-privacy (apply min (map :privacy tradeoff-rows))
+                 max-privacy (apply max (map :privacy tradeoff-rows))]
+             (cond->> tradeoff-rows
+               ;; Optionally restrict to a particular known-record-count
+               known-record-count (filter #(or (= (:known-record-count %) known-record-count)
+                                               (= :a-noop (:attack-type %))))
+               ;; Group either by mask-type or mask-type+noise-level
+               (not row-per-noise-level?) (group-by :mask-type)
+               row-per-noise-level? (group-by
+                                     #(cond
+                                        (= (:mask-type %) "RP Only") (:mask-type %)
+                                        (string/starts-with? (:mask-type %) "Sensitive-Drift") (str (:mask-type %) " - SD = " (:tradeoff %))
+                                        :else (str (:mask-type %) " - Level " (:tradeoff-level %))))
+               ;; Compute square distance
+               true (map-vals (fn [rows] (map #(+ (expt (/ (- (:classification-error %) min-error)
+                                                           (- max-error min-error))
+                                                        2)
+                                                  (expt (/ (- (:privacy %) min-privacy)
+                                                           (- max-privacy min-privacy))
+                                                        2))
+                                              rows)))
+               ;; Optionally convert to distance
+               (not square-distance?) (map-vals #(map sqrt %))
+               ;; Take mean of any multiple rows (only if grouping by
+               ;; mask-type or averaging over many known-record-counts)
+               true (map-vals mean)))))
         mask-keys (-> eps-mask-perfs vals first keys)]
     (sort-by
      #(get % "Mask")

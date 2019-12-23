@@ -3,7 +3,9 @@
 
 (defrecord IOAttackRecord [index input masked])
 
-(defrecord IOAttackData [projection-sigma independent-sigma cumulative-sigma knowns unknown])
+(defrecord IOAttackData [projection-sigma independent-sigma
+                         cumulative-sigma aggregation-window-size
+                         sd-value knowns unknown])
 
 (defn build-known-attack-record
   "Represents a known record in an input/output attack."
@@ -22,11 +24,15 @@
 (defn build-io-attack-data
   "Represents the data available during a known-io attack on a single
   unknown record given a set of known records."
-  [projection-sigma independent-sigma cumulative-sigma input-matrix masked-matrix
+  [projection-sigma independent-sigma cumulative-sigma
+   aggregation-window-size sd-value
+   input-matrix masked-matrix
    known-record-indexes unknown-record-index]
   (IOAttackData. projection-sigma
                  independent-sigma
                  cumulative-sigma
+                 aggregation-window-size
+                 sd-value
                  (->> known-record-indexes
                       ;; Sort to ensure records are in correct order.
                       (sort)

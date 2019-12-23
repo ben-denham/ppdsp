@@ -25,7 +25,7 @@ COPY project.clj /home/beakerx/ppdsp/project.clj
 RUN /bin/bash -c "source activate beakerx && cd /home/beakerx/ppdsp/ && lein deps && source deactivate"
 
 # Install Python dependencies
-RUN /opt/conda/envs/beakerx/bin/python -m pip install orange3 scipy scikit-posthocs
+RUN /opt/conda/envs/beakerx/bin/python -m pip install --no-binary orange3 orange3==3.20.0 scipy scikit-posthocs
 
 # Install Machine-Optimized Libraries for Smile
 USER root

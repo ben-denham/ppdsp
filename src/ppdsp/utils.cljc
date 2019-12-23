@@ -127,6 +127,11 @@
   [val-fn keys]
   (zipmap keys (map val-fn keys)))
 
+(defn remove-nth
+  "Utility function to remove the nth item from a vector."
+  [xs i]
+  (concat (subvec xs 0 i) (subvec xs (inc i))))
+
 (def ^:dynamic *format-precision* 5)
 
 (defn format-number [num]

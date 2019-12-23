@@ -90,7 +90,8 @@
               (recur (rest possible-indexes) li-rows result-indexes)))
           ;; We have run out of possible-indexes without reaching the
           ;; required row-count.
-          (throw (Exception. "Impossible to find linearly independent row(s).")))))))
+          (do
+            (throw (Exception. "Impossible to find linearly independent row(s)."))))))))
 
 (defn accumulate-rows
   "Returns a new matrix where each row is the sum of itself and all rows
@@ -185,3 +186,31 @@
        m/rows
        (map m/to-double-array)
        into-array))
+
+(defn submatrix-start-end
+  "Return a submatrix from the given start to the given end index."
+  [matrix dimension start end]
+  (m/submatrix matrix dimension [start (- end start)]))
+
+(defn matrix-batches
+  "Return a sequence of matrices, each containing batch-size rows from
+  the original matrix. If the number of rows is not divisible by
+  batch-size, the final batch will have fewer than batch-size
+  records."
+  [matrix batch-size]
+  (let [row-count (first (m/shape matrix))
+        max-row-index (dec row-count)
+        batch-count (Math/ceil (/ row-count batch-size))]
+    (map #(submatrix-start-end matrix 0
+                               (* % batch-size)
+                               (min (* (inc %) batch-size)
+                                    row-count))
+         (range batch-count))))
+
+(defn drop-column
+  [matrix col-index]
+  (let [col-count (second (m/shape matrix))]
+    (when (or (< col-index 0) (>= col-index col-count))
+      (throw (IndexOutOfBoundsException. "Column does not exist in matrix.")))
+    (join-col-wise (submatrix-start-end matrix 1 0 col-index)
+                   (submatrix-start-end matrix 1 (inc col-index) col-count))))

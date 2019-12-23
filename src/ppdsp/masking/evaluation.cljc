@@ -4,10 +4,13 @@
                                        make-distributed-dataset-mask]]
             [ppdsp.masking.projection
              :refer [make-random-projection-with-noise-and-translation-mask-factory]]
+            [ppdsp.masking.sensitive-drift
+             :refer [sd-mask]]
             [ppdsp.masking.attack-data :refer [build-io-attack-data]]
             [ppdsp.masking.single-stage-cumulative-attack :refer [known-io-projection-and-cumulative-noise-map-attack-single-stage]]
             [ppdsp.masking.two-stage-cumulative-attack :refer [known-io-projection-and-cumulative-noise-map-attack-two-stage]]
             [ppdsp.masking.two-stage-independent-attack :refer [known-io-projection-and-independent-noise-map-attack-two-stage]]
+            [ppdsp.masking.sensitive-drift :refer [noop-attack sd-attack]]
             [ppdsp.classifier.moa-classifier
              :refer [adaptive-random-forest perceptron]]
             [ppdsp.dataset.base :refer [get-schema dataset->matrix
@@ -127,7 +130,8 @@
   "Use the rng to generate data for a known input/output attack (in
   particular, selecting the known and unknown records)."
   [rng input-matrix masked-matrix projection-sigma
-   independent-sigma cumulative-sigma known-record-count known-record-range
+   independent-sigma cumulative-sigma aggregation-window-size sd-value
+   known-record-count known-record-range
    known-record-range-position]
   (let [record-count (m/row-count masked-matrix)
         [known-record-start known-record-end]
@@ -145,6 +149,7 @@
                                 :end-index known-record-end
                                 :init-li-row-indexes [unknown-record-index])]
     (build-io-attack-data projection-sigma independent-sigma cumulative-sigma
+                          aggregation-window-size sd-value
                           input-matrix masked-matrix
                           known-record-indexes unknown-record-index)))
 
@@ -204,7 +209,15 @@
    :a-rpin-1 {:attack-function known-io-projection-and-independent-noise-map-attack-two-stage
               :independent-noise? nil ;; Chosen based on cumulative-noise-sigma.
               :bias-input-prob? true
-              :only-one-known? true}})
+              :only-one-known? true}
+   :a-noop {:attack-function noop-attack
+            :independent-noise? nil
+            :bias-input-prob? nil
+            :only-one-known? nil}
+   :a-sd {:attack-function sd-attack
+          :independent-noise? nil
+          :bias-input-prob? nil
+          :only-one-known? nil}})
 
 (defn perform-attack
   "Perform an attack with the given io-attack-data with the given
@@ -219,9 +232,17 @@
         ;; are used for each strategy in this attack.
         base-attack-seed (max 0 (- (next-derived-seed! rng) attempt-count))
         attack-strategies (or attack-strategies (sort (keys (attack-strategy-map))))
+        ;; For attacks on sd, use a special list of attack-strategies
+        sd-attacks #{:a-noop :a-sd}
+        attack-strategies (if (nil? (:projection-sigma io-attack-data))
+                            (remove #(not (contains? sd-attacks %))
+                                    attack-strategies)
+                            (remove #(contains? sd-attacks %)
+                                    attack-strategies))
         ;; If no cumulative noise, do not include attack strategies
         ;; that account for cumulative noise.
-        attack-strategies (if (<= (:cumulative-sigma io-attack-data) 0)
+        attack-strategies (if (and (not (nil? (:cumulative-sigma io-attack-data)))
+                                   (<= (:cumulative-sigma io-attack-data) 0))
                             (remove #(contains? #{:a-rpcn-single-stage-unbalanced
                                                   :a-rpcn-single-stage
                                                   :a-rpcn-1-single-stage-unbalanced
@@ -232,7 +253,8 @@
                                                   :a-rpcn-1} %)
                                     attack-strategies)
                             attack-strategies)
-        attack-strategies (if (<= (:independent-sigma io-attack-data) 0)
+        attack-strategies (if (and (not (nil? (:independent-sigma io-attack-data)))
+                                   (<= (:independent-sigma io-attack-data) 0))
                             (remove #(contains? #{:a-rpin-unbalanced
                                                   :a-rpin
                                                   :a-rpin-1-unbalanced
@@ -242,7 +264,8 @@
     (zipmap
      attack-strategies
      (for [strategy attack-strategies]
-       (let [{:keys [attack-function cumulative-noise? independent-noise? bias-input-prob? only-one-known?]}
+       (let [{:keys [attack-function cumulative-noise? independent-noise?
+                     bias-input-prob? only-one-known?]}
              (get (attack-strategy-map) strategy)
              start-time (get-current-thread-time!)
              attempts (doall
@@ -319,6 +342,7 @@
                                                            projection-sigma
                                                            independent-sigma
                                                            cumulative-sigma
+                                                           nil nil
                                                            known-record-count
                                                            known-record-range
                                                            known-record-range-position))
@@ -342,6 +366,71 @@
               :true-known-noise-differences true-known-noise-differences
               :true-unknown-cumulative-noise
               (reduce m/add (take (:index (:unknown io-attack-data)) noise-log))})))}))
+    ;; Attack configuration combinations.
+    (for [known-record-count (or known-record-counts
+                                 (get-default-known-record-counts (m/column-count masked-matrix)))
+          known-record-range (or known-record-ranges
+                                 [0.1 0.5 1])]
+      ;; Each configuration needs its own rng to prevent race
+      ;; conditions when multi-threading.
+      [known-record-count known-record-range (seeded-rng (next-derived-seed! rng))]))})
+
+(defn evaluate-sd-privacy
+  "Privacy evaluation for masking based on the SD-perturbation method
+  of Solanki et AL. 2018"
+  [rng input-matrix masked-matrix
+   {:keys [attack-count attempt-count
+           known-record-counts known-record-ranges known-record-range-position
+           attack-strategies evaluation-threads]
+    :as privacy-evaluation-configuration} &
+   {:keys [sliding-window-size aggregation-window-size sd-value]}]
+  {:configuration privacy-evaluation-configuration
+   :evaluations
+   (pmap-pool
+    (or evaluation-threads 1)
+    (fn [[known-record-count known-record-range rng]]
+      (let [known-record-range-position (or known-record-range-position
+                                            :middle)]
+       (debug
+        (sync-println (str "Starting: privacy-evaluation"
+                           "-pf" (m/column-count masked-matrix)
+                           "-sw" sliding-window-size
+                           "-aw" aggregation-window-size
+                           "-sd" sd-value
+                           "-krc" known-record-count
+                           "-krr" known-record-range
+                           "-krrp" known-record-range-position)))
+       ;; Record contains raw results for this
+       ;; prior-knowledge-configuration.
+       {:known-record-count known-record-count
+        :known-record-range known-record-range
+        :known-record-range-position known-record-range-position
+        :attack-results
+        (doall
+         (for [i (range (or attack-count 100))]
+           (let [io-attack-data (try-times
+                                 100
+                                 (generate-io-attack-data! (seeded-rng (next-derived-seed! rng))
+                                                           input-matrix
+                                                           masked-matrix
+                                                           nil nil nil
+                                                           aggregation-window-size sd-value
+                                                           known-record-count
+                                                           known-record-range
+                                                           known-record-range-position))
+                 original-record (m/get-row input-matrix
+                                            (get-in io-attack-data [:unknown :index]))
+                 known-indexes (map :index (:knowns io-attack-data))
+                 attack-result (perform-attack (seeded-rng (next-derived-seed! rng))
+                                               io-attack-data original-record
+                                               1
+                                               :optimization-max-evaluations nil
+                                               :optimization-relative-threshold nil
+                                               :attack-strategies attack-strategies)]
+             {:strategies attack-result
+              :known-indexes (->> io-attack-data :knowns (map :index))
+              :unknown-index (->> io-attack-data :unknown :index)
+              :original-record (map double original-record)})))}))
     ;; Attack configuration combinations.
     (for [known-record-count (or known-record-counts
                                  (get-default-known-record-counts (m/column-count masked-matrix)))
@@ -398,25 +487,79 @@
            :translation translation
            :seed seed)))
 
+(defn sd-masking-experiment
+  "Masking experiment based on the SD-perturbation method of Solanki et
+  AL. 2018"
+  [& {:keys [raw-dataset sliding-window-size aggregation-window-size
+             sd-value classifier-fns privacy-evaluation-configuration
+             evaluations seed]}]
+  (let [rng (seeded-rng seed)
+        ;; We max/min normalise the dataset so that the effect of the
+        ;; same sigma (particularly for additive noise) is consistent
+        ;; across different datasets. This was previously done in
+        ;; Chen, K., Sun, G., & Liu, L. (2007, April). Towards
+        ;; attack-resilient geometric data perturbation. In
+        ;; proceedings of the 2007 SIAM international conference on
+        ;; Data mining (pp. 78-89). Society for Industrial and Applied
+        ;; Mathematics.
+        dataset (normalise-dataset raw-dataset)
+        masked-dataset (sd-mask dataset
+                                :sliding-window-size sliding-window-size
+                                :aggregation-window-size aggregation-window-size
+                                :sd-value sd-value)
+        input-matrix (dataset->matrix dataset)
+        masked-matrix (dataset->matrix masked-dataset)
+        evaluations (or evaluations [:accuracy :privacy])
+        output (zipmap
+                evaluations
+                (for [evaluation evaluations]
+                  (case evaluation
+                    :accuracy (map-vals #(test-classification-accuracy % masked-dataset)
+                                        classifier-fns)
+                    :privacy (evaluate-sd-privacy rng input-matrix masked-matrix
+                                                  privacy-evaluation-configuration
+                                                  :sliding-window-size sliding-window-size
+                                                  :aggregation-window-size aggregation-window-size
+                                                  :sd-value sd-value))))]
+    (assoc output
+           :sliding-window-size sliding-window-size
+           :aggregation-window-size aggregation-window-size
+           :sd-value sd-value
+           :seed seed)))
+
+(defn- inner-2 [[result evaluation]]
+  (mapcat
+   (fn [attack]
+     (map
+      (fn [[strategy recovery]]
+        (assoc recovery
+               :strategy strategy
+               :known-record-count (:known-record-count evaluation)
+               :known-record-range (:known-record-range evaluation)
+               :projection-features (get result :projection-features)
+               :projection-sigma (get result :projection-sigma)
+               :independent-noise-sigma (get result :independent-noise-sigma)
+               :cumulative-noise-sigma (get result :cumulative-noise-sigma)
+               :translation (get result :translation)
+               :sliding-window-size (get result :sliding-window-size)
+               :aggregation-window-size (get result :aggregation-window-size)
+               :sd-value (get result :sd-value)
+               :known-indexes (:known-indexes attack)
+               :unknown-index (:unknown-index attack)))
+      (-> attack :strategies)))
+   (-> evaluation :attack-results)))
+(defn- inner-1 [result]
+  (mapcat inner-2
+          (map vector (repeat result)
+               (-> result :privacy :evaluations))))
 (defn flatten-masking-experiment-recoveries
   "Take a sequence of outputs from masking-experiment, and return a
   flattened list of all record recoveries from attacks."
   [results]
-  (for [result results
-        evaluation (-> result :privacy :evaluations)
-        attack (-> evaluation :attack-results)
-        [strategy recovery] (-> attack :strategies)]
-    (assoc recovery
-           :strategy strategy
-           :known-record-count (:known-record-count evaluation)
-           :known-record-range (:known-record-range evaluation)
-           :projection-features (:projection-features result)
-           :projection-sigma (:projection-sigma result)
-           :independent-noise-sigma (:independent-noise-sigma result)
-           :cumulative-noise-sigma (:cumulative-noise-sigma result)
-           :translation (:translation result)
-           :known-indexes (:known-indexes attack)
-           :unknown-index (:unknown-index attack))))
+  ;; Use nested mapcats and defns instead of a for-loop because
+  ;; otherwise we get a "filename too long exception" due to the
+  ;; anonymous function of the for-loop.
+  (mapcat inner-1 results))
 
 (defn unknown-record-displacement
   "Return the displacement of the unknown record from the known records
